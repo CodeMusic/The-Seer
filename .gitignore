@@ -1,0 +1,17 @@
+# macOS junk
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Runtime logs (regenerated each run)
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp

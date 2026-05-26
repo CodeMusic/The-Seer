@@ -1,0 +1,6 @@
+# TheSeer Python dependencies
+rumps>=0.4.0      # menu-bar app for the 👁 status icon
+requests>=2.31    # HTTP client for screenpipe + MLX server
+mlx-vlm>=0.5.0    # vision-language model runtime (Apple Silicon)
+pynput>=1.7.6     # global keyboard hotkeys (Cmd+0 / Cmd+9) — requires
+                  # Accessibility permission in System Settings → Privacy & Security
