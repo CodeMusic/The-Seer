@@ -466,48 +466,78 @@ class TheSeer:
 
     # ── LLM calls ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _strip_think(text):
+        """Drop chain-of-thought some models emit. If a </think> is present,
+        the real answer is whatever follows the last one; then remove any
+        stray <think>/</think> tags that slipped through."""
+        if "</think>" in text.lower():
+            text = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
+        return re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
+
     def _confidence_call(self, persona_data, context, image=None):
-        """First LLM call: persona-flavoured tip + confidence score."""
-        # Universal output contract — applied to every persona. The text the
-        # model produces IS the user-facing notification, so we have to be
-        # explicit that there's no preamble, no meta-commentary, no narration
-        # about "the screen" or "your terminal".
-        system_msg = (
-            f"{persona_data['prompt']} {persona_data['negative_prompt']}\n\n"
-            "CONTEXT: screenpipe captures every open window. If the context marks an "
-            "ACTIVE WINDOW, that is what the user is focused on right now — base your insight "
-            "on it. Treat any BACKGROUND WINDOWS as supporting context only; do not comment on "
-            "them unless they directly bear on what's happening in the active window.\n\n"
-            "OUTPUT FORMAT (strict):\n"
-            "1. Begin with `[SCORE: X.X]` where X.X is your confidence "
-            "(0.0 = routine / not worth mentioning, 1.0 = critical / urgent).\n"
-            "2. Follow with a single space, then your message.\n"
-            "3. Your message is shown DIRECTLY to the user as a notification banner. "
-            "Write only the final content — no preamble (`Here's a tip:`, `Sure!`), "
-            "no meta-commentary (`I see you're…`, `Looking at your screen…`), "
-            "no references to `the screen`, `the terminal`, `your context`, `this moment`. "
-            "One clean standalone sentence — two at most.\n"
-            "4. NEVER name or describe the application or window (`the terminal shows…`, "
-            "`in VS Code…`, `the browser reveals…`). The app label in the context is only "
-            "to help you understand what you're looking at — it is NOT necessarily where the "
-            "content originated (e.g. a coding assistant running inside a terminal). Do not "
-            "narrate what the user is doing or what is on screen. Deliver the insight itself, "
-            "as if you already know the topic.\n"
-            "   BAD:  `The terminal shows theSeer.py was updated, suggesting you're planning next steps.`\n"
-            "   GOOD: `Renaming a tracked file? Use \\`git mv\\` so history follows it — a plain mv shows up as delete+add.`"
-        )
+        """First LLM call: persona-flavoured tip + confidence score.
+
+        Two persona families need different framing:
+          • ANALYTICAL (casual, engineer, executive, auditor) — examine the
+            screen and surface a concrete, useful observation/tip, self-scored
+            for confidence. Gets the strict output contract below.
+          • EXPRESSIVE (sassy, performance, teacher, entertainer, motivator) —
+            REACT to the screen in character (sass, a verse, an analogy, a
+            joke) and output only that. Forcing the analytical contract on them
+            flattened their voice and made them narrate, so they get a minimal
+            prompt and a fixed confidence (they're user-requested and bypass the
+            score gate anyway).
+        """
+        expressive = bool(persona_data.get("expressive"))
+
+        if expressive:
+            system_msg = (
+                f"{persona_data['prompt']} {persona_data['negative_prompt']}\n\n"
+                "The text below is what's on the user's screen right now — use it as raw "
+                "material to react to, but never describe, summarize, or narrate it. Stay "
+                "FULLY in character and output ONLY your response (your joke / verse / sassy "
+                "line / lesson) — nothing else. No preamble, no labels, no score, no "
+                "explanation, no <think> tags."
+            )
+            if image:
+                system_msg += (
+                    " A screenshot is also provided so you can see what's on screen — react "
+                    "to it in character; do not describe it."
+                )
+        else:
+            system_msg = (
+                f"{persona_data['prompt']} {persona_data['negative_prompt']}\n\n"
+                "CONTEXT: screenpipe captures every open window. If the context marks an "
+                "ACTIVE WINDOW, that is what the user is focused on right now — focus there and "
+                "treat any BACKGROUND WINDOWS as supporting context only.\n\n"
+                "OUTPUT FORMAT (strict):\n"
+                "1. Begin with `[SCORE: X.X]` where X.X is your confidence "
+                "(0.0 = routine / not worth mentioning, 1.0 = critical / urgent).\n"
+                "2. Follow with a single space, then your message — a single, clean, useful "
+                "tip in your role's voice. One sentence, two at most.\n"
+                "3. Your message is shown DIRECTLY to the user as a notification. No preamble "
+                "(`Here's a tip:`, `Sure!`) and no meta-commentary (`I see you're…`, `Looking "
+                "at your screen…`). Never name or narrate the screen, window, or app (`the "
+                "active window is…`, `the terminal shows…`, `in VS Code…`); the app label in "
+                "the context only helps you understand what you're looking at — it is NOT "
+                "necessarily where the content came from (e.g. a coding assistant running "
+                "inside a terminal). Give the advice itself, as if you already know the topic.\n"
+                "4. Output ONLY the final message. Do not emit reasoning, planning, or <think> tags."
+            )
+            if image:
+                system_msg += (
+                    "\n\nYou are also given a screenshot of the user's screen. Use BOTH the "
+                    "screenshot and the OCR text to ground your response in what's actually "
+                    "visible — layout, what's focused, diagrams, highlighted errors. Still "
+                    "never narrate the screen; just deliver your message."
+                )
 
         # Build the user turn. When we have a screenshot, send it in the
         # OpenAI vision format (a content-parts list) so the model can ground
         # its response in actual layout/focus/visuals, not just OCR text.
         user_text = f"Screen context: {context}"
         if image:
-            system_msg += (
-                "\n\nYou are also given a screenshot of the user's screen. Use BOTH the "
-                "screenshot and the OCR text to ground your response in what's actually "
-                "visible — layout, what's focused, diagrams, highlighted errors. Still "
-                "never narrate the screen; just deliver the insight."
-            )
             user_content = [
                 {"type": "text",      "text": user_text},
                 {"type": "image_url", "image_url": {"url": image}},
@@ -540,17 +570,21 @@ class TheSeer:
         if not choices:
             return None, None
 
-        raw   = choices[0]["message"]["content"].strip()
-        score = 1.0
-        # Case-insensitive — the model sometimes writes [Score: 1.0] or
-        # [score: 1.0] instead of [SCORE: 1.0]. Either way, strip the
-        # prefix so it doesn't pollute the displayed body.
-        m     = re.match(r"\[SCORE:\s*([0-9]*\.?[0-9]+)\]", raw, re.IGNORECASE)
+        raw   = self._strip_think(choices[0]["message"]["content"].strip())
+        # Strip a [SCORE: X.X] prefix if present. Analytical personas are asked
+        # to produce one; expressive personas aren't, but we strip it defensively
+        # in case one leaks through, so it never pollutes the displayed body.
+        # Case-insensitive — the model sometimes writes [Score: 1.0]/[score: 1.0].
+        parsed = 1.0
+        m      = re.match(r"\[SCORE:\s*([0-9]*\.?[0-9]+)\]", raw, re.IGNORECASE)
         if m:
-            score = min(1.0, max(0.0, float(m.group(1))))
-            tip   = raw[m.end():].strip()
+            parsed = min(1.0, max(0.0, float(m.group(1))))
+            tip    = raw[m.end():].strip()
         else:
-            tip   = raw
+            tip    = raw
+        # Expressive personas are user-requested and bypass the score gate, so
+        # their self-score is meaningless — use a fixed confidence instead.
+        score = 0.9 if expressive else parsed
         return score, tip
 
     def _ambient_call(self):
@@ -588,7 +622,8 @@ class TheSeer:
             )
             if response.status_code != 200:
                 return None, None
-            content = response.json()["choices"][0]["message"]["content"].strip()
+            content = self._strip_think(
+                response.json()["choices"][0]["message"]["content"].strip())
             # Ambient calls don't return a [SCORE: X.X] prefix — fixed confidence.
             return 0.7, content
         except Exception as e:

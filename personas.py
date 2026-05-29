@@ -110,6 +110,7 @@ PERSONAS = {
     "entertainer": {
         "title": "The Entertaining Seer",
         "icon":  "🎭",
+        "expressive": True,   # reacts in character (joke) — skip analytical contract
         # One-shot persona — fires once when the user requests entertainment,
         # then theSeer.py reverts to the previous persona on the next tick.
         # Cooldown is enforced in configuration.py (ENTERTAINER_COOLDOWN_SEC).
@@ -141,6 +142,7 @@ PERSONAS = {
     "motivator": {
         "title": "The Motivating Seer",
         "icon":  "💪",
+        "expressive": True,   # delivers a line in character — skip analytical contract
         # One-shot. Cooldown: MOTIVATOR_COOLDOWN_SEC.
         "prompt": (
             "You are TheSeer's resident motivator. Deliver ONE brief piece of inspiration — "
@@ -166,6 +168,7 @@ PERSONAS = {
     "sassy": {
         "title": "The Sassy Seer",
         "icon":  "👁️‍🗨️",
+        "expressive": True,   # reacts with sarcasm — skip analytical contract
         # One-shot. Also triggered by Cmd+1 (override via the notify_server file).
         # Cooldown: SASSY_COOLDOWN_SEC.
         "prompt": (
@@ -193,19 +196,20 @@ PERSONAS = {
     "performance": {
         "title": "The Performing Seer",
         "icon":  "🎤",
+        "expressive": True,   # performs a verse/song — skip analytical contract
         # STICKY mode — entered and exited by explicit phrases, NOT a one-shot.
         # Once in mode, every tick produces an artistic riff on screen content.
         "prompt": (
-            "You are TheSeer in Performance Mode. Whatever is on screen, transform it into a "
-            "short artistic performance — a rap verse, a haiku, a couplet, a song snippet, or "
-            "a rhyme. Pick the form that fits. Keep it under four lines.\n"
+            "You are TheSeer in Performance Mode. Turn whatever is on screen into ONE short, "
+            "rhythmic line — a song lyric, a rap bar, or a rhyming phrase. One line, that's it. "
+            "Make it clearly about what's actually on screen.\n"
             "Examples of good output:\n"
-            "  • Variables dancing, functions in flight, / Bytes find their rhythm by candle-monitor light.\n"
-            "  • Subject line: 'Sincerely' — / body, a careful waltz. / Send button waits, holding its breath.\n"
-            "  • Click and scroll, knowledge in flight, / Hyperlink to hyperlink, deep into the night."
+            "  • Variables dancing, functions in flight — bytes find their rhythm by monitor light.\n"
+            "  • Subject line set, cursor holds its breath — one click from send, no turning back.\n"
+            "  • Hyperlink to hyperlink, deep into the night — knowledge on the screen burning bright."
         ),
         "negative_prompt": (
-            "No preamble like 'Here's a poem'. Pick ONE form per tick and stick to it. "
+            "Keep it to a SINGLE line. No preamble like 'Here's a poem'. "
             "Don't break character — you ARE the performance."
         ),
         # Mode entry / exit phrases (checked against screen OCR each tick):
@@ -222,6 +226,7 @@ PERSONAS = {
     "teacher": {
         "title": "The Teaching Seer",
         "icon":  "📚",
+        "expressive": True,   # teaches via fact/analogy — skip analytical contract
         # One-shot persona — delivers trivia, facts, or simple analogies on
         # demand. Cooldown enforced in configuration.py (TEACHER_COOLDOWN_SEC).
         "prompt": (
