@@ -252,8 +252,11 @@ class TheSeer:
 
         Returns the (title, subtitle, body) actually delivered, or None."""
         clean_msg = " ".join(message.split())
-        if len(clean_msg) > 200:
-            clean_msg = clean_msg[:197] + "..."
+        # Safety net only — a well-behaved tip is 1–2 sentences and fits easily.
+        # Cut on a word boundary so we never chop mid-word (the ugly "…proc…").
+        BODY_LIMIT = 320
+        if len(clean_msg) > BODY_LIMIT:
+            clean_msg = clean_msg[:BODY_LIMIT].rsplit(" ", 1)[0].rstrip(" ,.;:—-") + "…"
         subtitle = "🚨 CRITICAL" if is_critical else "👁 TheSeer"
         payload  = json.dumps({
             "title":    title,

@@ -7,7 +7,8 @@ MODEL_ID = "mlx-community/MiniCPM-V-4.6-mxfp4"
 # Logic Settings
 CHECK_INTERVAL = 15  # Seconds between screen checks
 CONTEXT_LIMIT = 10   # Number of recent frames to analyze
-MAX_TOKENS = 60      # AI response length
+MAX_TOKENS = 100     # AI response length. Enough to finish 1–2 sentences cleanly;
+                     # 60 was so tight the model got cut off mid-thought.
 
 # Vision: send a screenshot to the (multimodal) model alongside OCR text.
 # This is the biggest single lever on feedback quality — the model can see
