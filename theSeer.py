@@ -132,7 +132,7 @@ def _append(target, text="", indent=3):
 def render_card(persona, ts, *, status,
                 apps=None, confidence=None, priority=None, final_score=None,
                 tip=None, sent_payload=None, threshold=None, skip_reason=None,
-                suppress_reason=None, context_preview=None):
+                suppress_reason=None, context_preview=None, used_image=False):
     """Render one tick as a vertically-stacked card. Always prints something."""
     label = f"{ts} · {persona.upper()} · {_STATUS[status]}"
     lines = [_header(label)]
@@ -157,7 +157,11 @@ def render_card(persona, ts, *, status,
 
     # Scored ticks (sent or suppressed): full breakdown
     apps_str = ", ".join(sorted(apps)) if apps else "—"
-    _append(lines, f"apps:    {apps_str}")
+    # 📸 marks ticks where a screenshot was captured and sent to the model.
+    apps_line = f"apps:    {apps_str}"
+    if used_image:
+        apps_line += "   📸 screenshot sent"
+    _append(lines, apps_line)
     if context_preview:
         _append(lines, f"seen:    \"{context_preview}\"")
     if confidence is not None and priority is not None and final_score is not None:
@@ -701,6 +705,10 @@ class TheSeer:
             filtered     = [f"[{a}]: {t}" for a, t in app_records if a.lower() not in excluded]
             context      = " ".join(filtered)[:1200]
 
+            # Tracks whether a screenshot was successfully captured AND handed
+            # to the model this tick. Surfaced as a 📸 on the terminal card.
+            used_image = False
+
             if context.strip():
                 # Normal flow — there's something to look at.
                 preview = re.sub(r"\s+", " ", context).strip()
@@ -711,6 +719,7 @@ class TheSeer:
                     confidence, tip = simple_classifier(self.current_persona, apps_seen, context)
                 else:
                     image = self._capture_screenshot() if cfg.SEND_SCREENSHOTS else None
+                    used_image = image is not None
                     confidence, tip = self._confidence_call(persona_data, context, image=image)
                     if confidence is None or tip is None:
                         render_card(self.current_persona, ts, status="skipped",
@@ -745,6 +754,7 @@ class TheSeer:
                     confidence, tip = simple_classifier(self.current_persona, apps_seen, "")
                 else:
                     image = self._capture_screenshot() if cfg.SEND_SCREENSHOTS else None
+                    used_image = image is not None
                     confidence, tip = self._confidence_call(
                         persona_data,
                         "(no on-screen text captured — the user explicitly requested you; "
@@ -789,7 +799,8 @@ class TheSeer:
                             confidence=confidence, priority=priority,
                             final_score=final_score, tip=tip,
                             threshold=cfg.NOTIFICATION_THRESHOLD,
-                            suppress_reason="model said 'all clear' — nothing to surface")
+                            suppress_reason="model said 'all clear' — nothing to surface",
+                            used_image=used_image)
                 return
 
             is_auditor       = self.current_persona == "auditor"
@@ -821,7 +832,7 @@ class TheSeer:
                             apps=apps_seen, context_preview=preview,
                             confidence=confidence, priority=priority,
                             final_score=final_score, tip=tip,
-                            sent_payload=payload)
+                            sent_payload=payload, used_image=used_image)
             else:
                 # Honest suppression reason — the old code always printed
                 # "final < threshold" even when the real cause was the dup guard.
@@ -838,7 +849,7 @@ class TheSeer:
                             confidence=confidence, priority=priority,
                             final_score=final_score, tip=tip,
                             threshold=cfg.NOTIFICATION_THRESHOLD,
-                            suppress_reason=reason)
+                            suppress_reason=reason, used_image=used_image)
 
         except Exception as e:
             self.log(f"❌ Error during tick: {e}")
