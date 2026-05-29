@@ -54,6 +54,7 @@ PAUSE_FILE        = "/tmp/theseer_chat_active"
 LOCK_FILE         = "/tmp/theseer_notify_server.pid"  # singleton lock
 OVERRIDE_FILE     = "/tmp/theseer_next_persona"       # hotkey → theSeer next-tick override
 PERF_TOGGLE_FILE  = "/tmp/theseer_perf_toggle"        # Cmd+2 → flip performance mode
+FEEDBACK_FILE     = "/tmp/theseer_feedback.json"      # per-persona engage/dismiss tallies → theSeer reads to tune thresholds
 
 # Personas that Cmd+` is allowed to pick at random. Auditor is excluded
 # (security shouldn't fire spuriously); performance is excluded because
@@ -487,6 +488,7 @@ class TheSeerNotifyServer(rumps.App):
             if entry.get("user_expanded"):
                 kept.append(entry)
             elif entry["dismiss_at"] <= now:
+                self._record_feedback(entry.get("data", {}).get("persona"), "neutral")
                 try: entry["panel"].orderOut_(None)
                 except: pass
                 removed = True
@@ -605,6 +607,25 @@ class TheSeerNotifyServer(rumps.App):
             expand_btn.setAction_("fire:")
             content.addSubview_(expand_btn)
 
+        # --- Close "✕" button (top-right, always present) ---
+        close_sz   = 16
+        close_btn  = AppKit.NSButton.alloc().initWithFrame_(
+            ((PANEL_WIDTH - 6 - close_sz, PANEL_HEIGHT - 4 - close_sz), (close_sz, close_sz))
+        )
+        close_btn.setBordered_(False)
+        close_btn.setButtonType_(AppKit.NSButtonTypeMomentaryChange)
+        close_btn.setAttributedTitle_(
+            AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                "✕",
+                {AppKit.NSForegroundColorAttributeName: AppKit.NSColor.tertiaryLabelColor(),
+                 AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(12)},
+            )
+        )
+        close_tgt = ToasterExpandTarget.alloc().init()
+        close_btn.setTarget_(close_tgt)
+        close_btn.setAction_("fire:")
+        content.addSubview_(close_btn)
+
         # Build the entry record BEFORE wiring click handlers (we close over it)
         entry = {
             "panel":          panel,
@@ -615,6 +636,8 @@ class TheSeerNotifyServer(rumps.App):
             "hint":           hint,
             "expand_btn":     expand_btn,
             "_expand_tgt":    expand_tgt,   # strong ref — prevents ObjC GC
+            "close_btn":      close_btn,
+            "_close_tgt":     close_tgt,    # strong ref — prevents ObjC GC
             "dismiss_at":     time.monotonic() + DISMISS_AFTER_SEC,
             "is_expanded":    False,
             "user_expanded":  False,   # True only when the user clicks "more ▾"
@@ -637,6 +660,7 @@ class TheSeerNotifyServer(rumps.App):
 
         if expand_tgt is not None:
             expand_tgt.set_callback(lambda _e=entry: self._do_toggle_expand(_e))
+        close_tgt.set_callback(lambda _e=entry: self._dismiss_panel(_e))
 
         panel.setContentView_(content)
         panel.orderFrontRegardless()
@@ -735,7 +759,44 @@ class TheSeerNotifyServer(rumps.App):
     # ── Click on the body → open chat ───────────────────────────────
 
     @objc.python_method
+    def _record_feedback(self, persona, signal):
+        """Tally an engagement signal for a persona so theSeer can tune how
+        often it speaks. signal ∈ {"positive","negative","neutral"}:
+          positive = user clicked to chat   (wants more)
+          negative = user hit ✕ to dismiss  (wants less)
+          neutral  = toaster auto-timed-out (no strong opinion)
+        Written atomically; theSeer reads it read-only, so a torn read is fine."""
+        if not persona:
+            return
+        try:
+            data = {}
+            if os.path.exists(FEEDBACK_FILE):
+                with open(FEEDBACK_FILE) as f:
+                    data = json.load(f)
+            row = data.get(persona) or {"positive": 0, "negative": 0, "neutral": 0}
+            row[signal] = row.get(signal, 0) + 1
+            data[persona] = row
+            tmp = FEEDBACK_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, FEEDBACK_FILE)
+        except Exception:
+            pass   # feedback is best-effort; never break the UI over it
+
+    @objc.python_method
+    def _dismiss_panel(self, entry):
+        """Close a toaster outright (the ✕ button) — no chat, no replay side effects."""
+        self._record_feedback(entry.get("data", {}).get("persona"), "negative")
+        try: entry["panel"].orderOut_(None)
+        except: pass
+        if entry in self._panels:
+            self._panels.remove(entry)
+            self._restack_panels()
+
+    @objc.python_method
     def _toaster_clicked(self, entry):
+        # Clicking through to chat is the strongest "I want this" signal.
+        self._record_feedback(entry.get("data", {}).get("persona"), "positive")
         # Dismiss the toaster
         try: entry["panel"].orderOut_(None)
         except: pass
@@ -793,6 +854,9 @@ class TheSeerNotifyServer(rumps.App):
             ((HORIZONTAL_PAD, BODY_BOTTOM_PAD), (body_w, body_h))
         )
         entry["expand_btn"].setTitle_("less ▴")
+        entry["close_btn"].setFrame_(
+            ((PANEL_WIDTH - 6 - 16, new_h - 4 - 16), (16, 16))
+        )
 
         entry["is_expanded"] = True
         self._restack_panels()
@@ -821,6 +885,9 @@ class TheSeerNotifyServer(rumps.App):
              (body_w, PANEL_HEIGHT - TITLE_H - SUBTITLE_H - BODY_BOTTOM_PAD - 6))
         )
         entry["expand_btn"].setTitle_("more ▾")
+        entry["close_btn"].setFrame_(
+            ((PANEL_WIDTH - 6 - 16, PANEL_HEIGHT - 4 - 16), (16, 16))
+        )
 
         entry["is_expanded"]   = False
         entry["user_expanded"] = False   # un-pin: re-arm the dismiss timer

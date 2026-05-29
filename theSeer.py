@@ -20,6 +20,7 @@ notification) can be verified without the MLX server running.
 
 import argparse
 import base64
+import difflib
 import fcntl
 import json
 import os
@@ -220,6 +221,10 @@ class TheSeer:
         # flag is set in determine_persona and cleared at the start of the
         # following tick.
         self._overridden_this_tick = False
+        # Change detection: normalized active-window text from the previous tick.
+        # Analytical personas skip re-analysing a screen that hasn't changed,
+        # which stops repetition and saves a model call on a static screen.
+        self._last_screen_text     = ""
 
         msg = "TheSeer is watching your screen. Notifications are working!"
         if test_mode:
@@ -298,6 +303,16 @@ class TheSeer:
     OVERRIDE_FILE     = "/tmp/theseer_next_persona"
     # File notify_server touches when Cmd+2 is pressed to toggle perf mode.
     PERF_TOGGLE_FILE  = "/tmp/theseer_perf_toggle"
+    # File notify_server writes per-persona engage/dismiss tallies to. We read
+    # it (read-only) to nudge each persona's notification threshold: personas
+    # the user keeps dismissing get a higher bar (speak less); personas they
+    # click through to chat get a lower bar (speak more).
+    FEEDBACK_FILE     = "/tmp/theseer_feedback.json"
+    # How far feedback can move a persona's threshold, up or down.
+    FEEDBACK_MAX_ADJ  = 0.2
+    # Engage/dismiss signals needed before the nudge reaches full strength —
+    # keeps a single stray click from swinging the bar wildly.
+    FEEDBACK_FULL_AT  = 5
 
     def determine_persona(self, raw_text_all_apps, apps_seen, focused_text=""):
         context_lower = raw_text_all_apps.lower()
@@ -438,19 +453,55 @@ class TheSeer:
 
     SCREENSHOT_PATH = "/tmp/theseer_frame.jpg"
 
-    def _capture_screenshot(self):
-        """Grab the main display, downscale, and return a base64 JPEG data URI
-        (the format mlx_vlm's server accepts). Returns None on any failure so
-        the caller degrades gracefully to OCR-only.
+    @staticmethod
+    def _frontmost_window_id():
+        """CGWindowID of the focused app's frontmost real window, or None.
 
-        Uses only macOS built-ins (screencapture + sips) — no Python image deps."""
+        screencapture works on display indices or window ids, not app names, so
+        we ask the window server: take the active app's pid, then the first
+        on-screen, normal-layer (0) window of meaningful size — the window list
+        is already front-to-back z-order, so that's the focused window."""
         try:
-            # -x: silent, -t jpg: JPEG, -D 1: main display only (avoids huge
-            # multi-monitor grabs). Captures without the cursor or shadows.
-            subprocess.run(
-                ["screencapture", "-x", "-t", "jpg", "-D", "1", self.SCREENSHOT_PATH],
-                check=True, timeout=5, capture_output=True,
-            )
+            import Quartz
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app is None:
+                return None
+            pid  = app.processIdentifier()
+            opts = (Quartz.kCGWindowListOptionOnScreenOnly
+                    | Quartz.kCGWindowListExcludeDesktopElements)
+            for w in Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID):
+                if w.get("kCGWindowOwnerPID") != pid:
+                    continue
+                if w.get("kCGWindowLayer", 0) != 0:   # skip menubar/panels/overlays
+                    continue
+                b = w.get("kCGWindowBounds", {})
+                if b.get("Width", 0) < 100 or b.get("Height", 0) < 100:
+                    continue
+                return int(w.get("kCGWindowNumber"))
+        except Exception:
+            pass
+        return None
+
+    def _capture_screenshot(self):
+        """Grab the focused window (falling back to the main display), downscale,
+        and return a base64 JPEG data URI (the format mlx_vlm's server accepts).
+        Returns None on any failure so the caller degrades gracefully to OCR-only.
+
+        Capturing just the active window sharpens grounding (the model isn't
+        distracted by background apps) and works regardless of which monitor the
+        window is on. Uses only macOS built-ins — no Python image deps."""
+        try:
+            wid = self._frontmost_window_id()
+            if wid is not None:
+                # -o: omit the window's drop shadow. -l: capture that window id.
+                cmd = ["screencapture", "-x", "-o", "-t", "jpg", "-l", str(wid),
+                       self.SCREENSHOT_PATH]
+            else:
+                # -D 1: main display only (avoids huge multi-monitor grabs).
+                cmd = ["screencapture", "-x", "-t", "jpg", "-D", "1",
+                       self.SCREENSHOT_PATH]
+            subprocess.run(cmd, check=True, timeout=5, capture_output=True)
             # Cap the longest side so the payload + vision encoding stay fast.
             max_px = getattr(cfg, "SCREENSHOT_MAX_PX", 1400)
             subprocess.run(
@@ -475,7 +526,7 @@ class TheSeer:
             text = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
         return re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
 
-    def _confidence_call(self, persona_data, context, image=None):
+    def _confidence_call(self, persona_data, context, image=None, recent_tips=None):
         """First LLM call: persona-flavoured tip + confidence score.
 
         Two persona families need different framing:
@@ -531,6 +582,14 @@ class TheSeer:
                     "screenshot and the OCR text to ground your response in what's actually "
                     "visible — layout, what's focused, diagrams, highlighted errors. Still "
                     "never narrate the screen; just deliver your message."
+                )
+            # Session memory: surface what we've already said so the model picks
+            # a genuinely new angle instead of rephrasing a recent tip.
+            if recent_tips:
+                recent = "\n".join(f"  • {t}" for t in recent_tips[-5:])
+                system_msg += (
+                    "\n\nYou have ALREADY given the user these tips recently — do NOT repeat "
+                    "them or their topics; surface something new:\n" + recent
                 )
 
         # Build the user turn. When we have a screenshot, send it in the
@@ -629,6 +688,31 @@ class TheSeer:
         except Exception as e:
             self.log(f"⚠️  Ambient call failed: {e}")
             return None, None
+
+    def _effective_threshold(self, persona):
+        """Base NOTIFICATION_THRESHOLD nudged by how the user reacts to THIS
+        persona. Engage (click→chat) lowers the bar so it speaks more often;
+        dismiss (✕) raises it so it speaks less. Auto-timeouts are neutral and
+        ignored here. Bounded to ±FEEDBACK_MAX_ADJ and ramped in by sample size
+        so one stray signal can't swing it. Read-only; returns the base on any
+        problem so the engine never breaks over feedback bookkeeping."""
+        base = cfg.NOTIFICATION_THRESHOLD
+        try:
+            with open(self.FEEDBACK_FILE) as f:
+                row = json.load(f).get(persona)
+            if not row:
+                return base
+            pos = row.get("positive", 0)
+            neg = row.get("negative", 0)
+            decisive = pos + neg
+            if decisive == 0:
+                return base
+            rate     = (pos - neg) / decisive                  # [-1, +1]
+            strength = min(decisive / self.FEEDBACK_FULL_AT, 1.0)
+            adj      = -rate * self.FEEDBACK_MAX_ADJ * strength  # +engage → lower bar
+            return max(0.0, min(1.0, base + adj))
+        except Exception:
+            return base
 
     def _priority_call(self, tip):
         """Second LLM call: rate THIS tip's worth against recently-sent ones."""
@@ -786,12 +870,31 @@ class TheSeer:
                 if len(preview) > 100:
                     preview = preview[:97] + "..."
 
+                # ── Change detection ──────────────────────────────────
+                # An analytical persona has nothing new to add when the active
+                # window hasn't meaningfully changed since last tick — skip the
+                # model call entirely (stops repetition, saves compute). Auditor
+                # always re-scans for secrets; user-requested and expressive
+                # personas were explicitly asked for, so they're exempt.
+                cur_screen = re.sub(r"\s+", " ", active_text or context).strip()
+                prev_screen = self._last_screen_text
+                self._last_screen_text = cur_screen   # refresh baseline every tick
+                analytical = not persona_data.get("expressive")
+                if (analytical and self.current_persona != "auditor"
+                        and not self._overridden_this_tick and prev_screen
+                        and difflib.SequenceMatcher(None, cur_screen, prev_screen).ratio() >= 0.92):
+                    render_card(self.current_persona, ts, status="skipped",
+                                skip_reason="screen unchanged since last look")
+                    return
+
                 if self.test_mode:
                     confidence, tip = simple_classifier(self.current_persona, apps_seen, context)
                 else:
                     image = self._capture_screenshot() if cfg.SEND_SCREENSHOTS else None
                     used_image = image is not None
-                    confidence, tip = self._confidence_call(persona_data, context, image=image)
+                    confidence, tip = self._confidence_call(
+                        persona_data, context, image=image,
+                        recent_tips=list(self.sent_history))
                     if confidence is None or tip is None:
                         render_card(self.current_persona, ts, status="skipped",
                                     skip_reason="LLM confidence call failed")
@@ -832,6 +935,7 @@ class TheSeer:
                         "use the screenshot if it helps, otherwise just deliver your content "
                         "without referencing the screen)",
                         image=image,
+                        recent_tips=list(self.sent_history),
                     )
                     if confidence is None or tip is None:
                         render_card(self.current_persona, ts, status="skipped",
@@ -862,6 +966,7 @@ class TheSeer:
             # ── 2. Priority call ─────────────────────────────────
             priority    = self._priority_call(tip)
             final_score = (confidence + priority) / 2.0
+            eff_thr     = self._effective_threshold(self.current_persona)
 
             # ── 3. Decide & emit ─────────────────────────────────
             if all_clear:
@@ -869,7 +974,7 @@ class TheSeer:
                             apps=apps_seen, context_preview=preview,
                             confidence=confidence, priority=priority,
                             final_score=final_score, tip=tip,
-                            threshold=cfg.NOTIFICATION_THRESHOLD,
+                            threshold=eff_thr,
                             suppress_reason="model said 'all clear' — nothing to surface",
                             used_image=used_image)
                 return
@@ -883,7 +988,7 @@ class TheSeer:
             # pattern we want to suppress. Cross-persona overlap is fine.
             last_tip_here    = self._last_tip_by_persona.get(self.current_persona)
             is_exact_dup     = (last_tip_here is not None and tip == last_tip_here)
-            above_thr        = final_score >= cfg.NOTIFICATION_THRESHOLD
+            above_thr        = final_score >= eff_thr
             should_notify = (
                 is_auditor
                 or (is_user_initiated and not is_exact_dup)
@@ -909,17 +1014,17 @@ class TheSeer:
                 # "final < threshold" even when the real cause was the dup guard.
                 if is_exact_dup and above_thr:
                     reason = (f"{self.current_persona} just sent this same tip "
-                              f"(final {final_score:.2f} ≥ {cfg.NOTIFICATION_THRESHOLD:.2f}, but identical)")
+                              f"(final {final_score:.2f} ≥ {eff_thr:.2f}, but identical)")
                 elif is_exact_dup:
                     reason = (f"{self.current_persona} just sent this same tip "
-                              f"(final {final_score:.2f} also below threshold {cfg.NOTIFICATION_THRESHOLD:.2f})")
+                              f"(final {final_score:.2f} also below threshold {eff_thr:.2f})")
                 else:
-                    reason = f"final {final_score:.2f} < threshold {cfg.NOTIFICATION_THRESHOLD:.2f}"
+                    reason = f"final {final_score:.2f} < threshold {eff_thr:.2f}"
                 render_card(self.current_persona, ts, status="suppressed",
                             apps=apps_seen, context_preview=preview,
                             confidence=confidence, priority=priority,
                             final_score=final_score, tip=tip,
-                            threshold=cfg.NOTIFICATION_THRESHOLD,
+                            threshold=eff_thr,
                             suppress_reason=reason, used_image=used_image)
 
         except Exception as e:
