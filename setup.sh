@@ -14,11 +14,11 @@ command -v python3 >/dev/null || { echo -e "${RED}python3 not found.${NC}";     
 command -v npx     >/dev/null || { echo -e "${RED}Node.js / npx not found. Install Node first.${NC}"; exit 1; }
 
 # --- 1. Python deps --------------------------------------------------
-echo -e "${GREEN}1/2 Installing Python dependencies...${NC}"
-python3 -m pip install --quiet --upgrade -r requirements.txt
+echo -e "${GREEN}1/3 Installing Python dependencies...${NC}"
+python3 -m pip install --quiet --upgrade -r requirements.txt --break-system-packages
 
 # --- 2. Screenpipe cache --------------------------------------------
-echo -e "${GREEN}2/2 Prefetching screenpipe@0.3.345...${NC}"
+echo -e "${GREEN}2/3 Prefetching screenpipe@0.3.345...${NC}"
 if command -v screenpipe >/dev/null 2>&1; then
     echo -e "   ${GREEN}✓${NC} screenpipe already on PATH: $(command -v screenpipe)"
 else
@@ -33,10 +33,23 @@ else
     fi
 fi
 
-# Warn if the screenpipe token hasn't been set
+# --- 3. Screenpipe token --------------------------------------------
+echo -e "${GREEN}3/3 Checking screenpipe token...${NC}"
 if grep -q '^SCREENPIPE_TOKEN = "sp-XXXX' configuration.py 2>/dev/null; then
-    echo -e "${YELLOW}⚠  Set SCREENPIPE_TOKEN in configuration.py.${NC}"
-    echo -e "${YELLOW}   Get one with: npx screenpipe@0.3.345 auth token${NC}"
+    echo -e "   ${YELLOW}No token set — running: npx screenpipe@0.3.345 auth token${NC}"
+    TOKEN_OUTPUT=$(npx -y screenpipe@0.3.345 auth token 2>&1)
+    NEW_TOKEN=$(echo "$TOKEN_OUTPUT" | grep -oE 'sp-[a-f0-9]+' | head -1)
+    if [ -n "$NEW_TOKEN" ]; then
+        sed -i '' "s/SCREENPIPE_TOKEN = \"[^\"]*\"/SCREENPIPE_TOKEN = \"$NEW_TOKEN\"/" configuration.py
+        echo -e "   ${GREEN}✓${NC} Token set: $NEW_TOKEN"
+    else
+        echo -e "   ${RED}✗${NC} Could not extract token from output:"
+        echo "$TOKEN_OUTPUT"
+        echo -e "${YELLOW}   Set it manually: npx screenpipe@0.3.345 auth token${NC}"
+        echo -e "${YELLOW}   Then update SCREENPIPE_TOKEN in configuration.py${NC}"
+    fi
+else
+    echo -e "   ${GREEN}✓${NC} Token already set"
 fi
 
 cat <<EOF

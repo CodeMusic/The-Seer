@@ -355,6 +355,27 @@ class ChatWindow(AppKit.NSObject):
 
 
 # ──────────────────────────────────────────────────────────────────
+# NSObject shim for expand button target/action
+# ──────────────────────────────────────────────────────────────────
+
+class ToasterExpandTarget(AppKit.NSObject):
+    """Thin NSObject so NSButton can dispatch its action to a Python callback.
+
+    rumps.App is a pure Python class — setting it as an NSButton target
+    silently fails ObjC action dispatch, so we route through this instead.
+    """
+
+    @objc.python_method
+    def set_callback(self, cb):
+        self._cb = cb
+
+    def fire_(self, sender):
+        cb = getattr(self, "_cb", None)
+        if cb is not None:
+            cb()
+
+
+# ──────────────────────────────────────────────────────────────────
 # Notification server
 # ──────────────────────────────────────────────────────────────────
 
@@ -482,9 +503,11 @@ class TheSeerNotifyServer(rumps.App):
             return
         visible = screen.visibleFrame()
 
-        # Measure body text height so we know if we need a "more ▾" button
+        # Measure body text height so we know if we need a "more ▾" button.
+        # avail_body_h must match the actual body label frame height (the extra
+        # - 6 below), otherwise text that overflows can slip past the threshold.
         body_w        = PANEL_WIDTH - 2 * HORIZONTAL_PAD
-        avail_body_h  = PANEL_HEIGHT - TITLE_H - SUBTITLE_H - BODY_BOTTOM_PAD
+        avail_body_h  = PANEL_HEIGHT - TITLE_H - SUBTITLE_H - BODY_BOTTOM_PAD - 6
         body_full_h   = self._measure_body_height(body, body_w)
         needs_more    = body_full_h > avail_body_h + 2   # +2px tolerance
 
@@ -565,6 +588,7 @@ class TheSeerNotifyServer(rumps.App):
 
         # --- Expand button "more ▾" (only if body overflows) ---
         expand_btn = None
+        expand_tgt = None
         if needs_more:
             btn_w, btn_h = 56, 18
             expand_btn = AppKit.NSButton.alloc().initWithFrame_(
@@ -573,8 +597,9 @@ class TheSeerNotifyServer(rumps.App):
             expand_btn.setBezelStyle_(AppKit.NSBezelStyleInline)
             expand_btn.setTitle_("more ▾")
             expand_btn.setFont_(AppKit.NSFont.systemFontOfSize_(10))
-            expand_btn.setTarget_(self)
-            expand_btn.setAction_("toggleExpand:")
+            expand_tgt = ToasterExpandTarget.alloc().init()
+            expand_btn.setTarget_(expand_tgt)
+            expand_btn.setAction_("fire:")
             content.addSubview_(expand_btn)
 
         # Build the entry record BEFORE wiring click handlers (we close over it)
@@ -586,6 +611,7 @@ class TheSeerNotifyServer(rumps.App):
             "body_label":     body_label,
             "hint":           hint,
             "expand_btn":     expand_btn,
+            "_expand_tgt":    expand_tgt,   # strong ref — prevents ObjC GC
             "dismiss_at":     time.monotonic() + DISMISS_AFTER_SEC,
             "is_expanded":    False,
             "body_full_text": body,
@@ -605,10 +631,19 @@ class TheSeerNotifyServer(rumps.App):
             self._toaster_hover(_entry, is_in)
         content.install(_on_click, _on_hover_change)
 
+        if expand_tgt is not None:
+            expand_tgt.set_callback(lambda _e=entry: self._do_toggle_expand(_e))
+
         panel.setContentView_(content)
         panel.orderFrontRegardless()
 
         self._panels.append(entry)
+
+        # Auto-expand fresh notifications when the setting is on.
+        # Replays (record=False, e.g. Cmd+0) always spawn collapsed.
+        if needs_more and record and cfg.SPAWN_EXPANDED:
+            self._expand_panel(entry)
+
         if record:
             self._append_history({
                 "title":    title,
@@ -718,12 +753,8 @@ class TheSeerNotifyServer(rumps.App):
 
     # ── Click on the "more ▾" / "less ▴" button → expand/collapse ───
 
-    def toggleExpand_(self, sender):
-        # Find the entry that owns this button
-        entry = next((e for e in self._panels if e["expand_btn"] is sender), None)
-        if entry is None:
-            return
-
+    @objc.python_method
+    def _do_toggle_expand(self, entry):
         if entry["is_expanded"]:
             self._collapse_panel(entry)
         else:
