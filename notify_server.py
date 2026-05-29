@@ -477,11 +477,14 @@ class TheSeerNotifyServer(rumps.App):
                 record=not is_meta,   # meta pings show but don't enter history
             )
 
-        # 2. Expire old panels (skip expanded ones — they stay until clicked)
+        # 2. Expire old panels. A panel the USER manually expanded stays until
+        #    clicked (they're reading it). Auto-spawned-expanded panels
+        #    (SPAWN_EXPANDED) still obey the dismiss timer — otherwise every
+        #    toaster would be immortal and they'd pile up forever.
         now = time.monotonic()
         kept, removed = [], False
         for entry in self._panels:
-            if entry["is_expanded"]:
+            if entry.get("user_expanded"):
                 kept.append(entry)
             elif entry["dismiss_at"] <= now:
                 try: entry["panel"].orderOut_(None)
@@ -614,6 +617,7 @@ class TheSeerNotifyServer(rumps.App):
             "_expand_tgt":    expand_tgt,   # strong ref — prevents ObjC GC
             "dismiss_at":     time.monotonic() + DISMISS_AFTER_SEC,
             "is_expanded":    False,
+            "user_expanded":  False,   # True only when the user clicks "more ▾"
             "body_full_text": body,
             "body_full_h":    body_full_h,
             "data": {
@@ -758,6 +762,8 @@ class TheSeerNotifyServer(rumps.App):
         if entry["is_expanded"]:
             self._collapse_panel(entry)
         else:
+            # Manual expand pins the panel open (immune to the dismiss timer).
+            entry["user_expanded"] = True
             self._expand_panel(entry)
 
     @objc.python_method
@@ -816,9 +822,10 @@ class TheSeerNotifyServer(rumps.App):
         )
         entry["expand_btn"].setTitle_("more ▾")
 
-        entry["is_expanded"] = False
+        entry["is_expanded"]   = False
+        entry["user_expanded"] = False   # un-pin: re-arm the dismiss timer
         # Re-arm dismiss timer so it doesn't vanish instantly after collapse
-        entry["dismiss_at"]  = time.monotonic() + DISMISS_AFTER_SEC
+        entry["dismiss_at"]    = time.monotonic() + DISMISS_AFTER_SEC
         self._restack_panels()
 
     # ── History ─────────────────────────────────────────────────────

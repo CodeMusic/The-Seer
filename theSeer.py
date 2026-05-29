@@ -471,6 +471,10 @@ class TheSeer:
         # about "the screen" or "your terminal".
         system_msg = (
             f"{persona_data['prompt']} {persona_data['negative_prompt']}\n\n"
+            "CONTEXT: screenpipe captures every open window. If the context marks an "
+            "ACTIVE WINDOW, that is what the user is focused on right now — base your insight "
+            "on it. Treat any BACKGROUND WINDOWS as supporting context only; do not comment on "
+            "them unless they directly bear on what's happening in the active window.\n\n"
             "OUTPUT FORMAT (strict):\n"
             "1. Begin with `[SCORE: X.X]` where X.X is your confidence "
             "(0.0 = routine / not worth mentioning, 1.0 = critical / urgent).\n"
@@ -479,7 +483,15 @@ class TheSeer:
             "Write only the final content — no preamble (`Here's a tip:`, `Sure!`), "
             "no meta-commentary (`I see you're…`, `Looking at your screen…`), "
             "no references to `the screen`, `the terminal`, `your context`, `this moment`. "
-            "One clean standalone sentence — two at most."
+            "One clean standalone sentence — two at most.\n"
+            "4. NEVER name or describe the application or window (`the terminal shows…`, "
+            "`in VS Code…`, `the browser reveals…`). The app label in the context is only "
+            "to help you understand what you're looking at — it is NOT necessarily where the "
+            "content originated (e.g. a coding assistant running inside a terminal). Do not "
+            "narrate what the user is doing or what is on screen. Deliver the insight itself, "
+            "as if you already know the topic.\n"
+            "   BAD:  `The terminal shows theSeer.py was updated, suggesting you're planning next steps.`\n"
+            "   GOOD: `Renaming a tracked file? Use \\`git mv\\` so history follows it — a plain mv shows up as delete+add.`"
         )
 
         # Build the user turn. When we have a screenshot, send it in the
@@ -702,8 +714,29 @@ class TheSeer:
 
             persona_data = p.PERSONAS[self.current_persona]
             excluded     = [a.lower() for a in persona_data.get("exclude_apps", [])]
-            filtered     = [f"[{a}]: {t}" for a, t in app_records if a.lower() not in excluded]
-            context      = " ".join(filtered)[:1200]
+
+            # screenpipe captures EVERY open window, but the active window is
+            # what the user is actually working in — so we present it as the
+            # primary subject and demote the rest to background context. The
+            # active window also gets first claim on the character budget.
+            CONTEXT_BUDGET = 1200
+            active_text = (focused_text.strip()
+                           if focused_app and focused_app.lower() not in excluded else "")
+            other_parts = [f"[{a}]: {t}" for a, t in app_records
+                           if a != focused_app and a.lower() not in excluded]
+            other_text  = " ".join(other_parts).strip()
+
+            if active_text:
+                context = f"ACTIVE WINDOW — {focused_app} (the user is focused here):\n{active_text}"
+                remaining = CONTEXT_BUDGET - len(context)
+                if other_text and remaining > 120:
+                    context += ("\n\nBACKGROUND WINDOWS (other open apps — context only):\n"
+                                + other_text[:remaining - 80])
+            else:
+                # Focused app was excluded for this persona (or unknown) — fall
+                # back to the background blob as the working context.
+                context = other_text
+            context = context[:CONTEXT_BUDGET]
 
             # Tracks whether a screenshot was successfully captured AND handed
             # to the model this tick. Surfaced as a 📸 on the terminal card.
