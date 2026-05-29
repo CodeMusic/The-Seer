@@ -8,6 +8,17 @@ MODEL_ID = "mlx-community/MiniCPM-V-4.6-mxfp4"
 CHECK_INTERVAL = 15  # Seconds between screen checks
 CONTEXT_LIMIT = 10   # Number of recent frames to analyze
 MAX_TOKENS = 60      # AI response length
+
+# Vision: send a screenshot to the (multimodal) model alongside OCR text.
+# This is the biggest single lever on feedback quality — the model can see
+# layout, focus, diagrams, and error highlights that OCR throws away.
+SEND_SCREENSHOTS = True      # Set False to fall back to OCR-only (faster, lower quality)
+SCREENSHOT_MAX_PX = 1400     # Cap the longest side before sending. Smaller = faster inference.
+
+# Ambient chatter: when the screen is genuinely quiet, Casual only pipes up
+# at most once per this many seconds. An ambient assistant that talks every
+# tick becomes noise you learn to ignore — silence is a feature.
+AMBIENT_QUIET_GAP_SEC = 1800  # 30 min. Lower for a chattier idle assistant; raise for near-silence.
 REVERT_THRESHOLD = 2         # Consecutive clean ticks required before leaving auditor mode
 NOTIFICATION_THRESHOLD = 0.6 # Minimum score (0.0–1.0) required to show an alert
 SPAWN_EXPANDED = True       # Auto-expand new toasters that overflow; Cmd+0 replays always spawn collapsed

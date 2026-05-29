@@ -19,10 +19,12 @@ notification) can be verified without the MLX server running.
 """
 
 import argparse
+import base64
 import fcntl
 import json
 import os
 import re
+import subprocess
 import sys
 import textwrap
 import time
@@ -206,6 +208,9 @@ class TheSeer:
         self._one_shot_last_fired  = {}
         # Performance mode is a sticky toggle (entered/exited by phrases).
         self._performance_mode     = False
+        # Last time the quiet-screen ambient call fired (monotonic). Used to
+        # rate-limit ambient chatter so an idle screen stays mostly silent.
+        self._last_ambient_at      = 0.0
         # When a hotkey override fires (Cmd+1, Cmd+`), the next tick uses
         # the overridden persona AND bypasses the score threshold. This
         # flag is set in determine_persona and cleared at the start of the
@@ -287,8 +292,12 @@ class TheSeer:
     # File notify_server touches when Cmd+2 is pressed to toggle perf mode.
     PERF_TOGGLE_FILE  = "/tmp/theseer_perf_toggle"
 
-    def determine_persona(self, raw_text_all_apps, apps_seen):
+    def determine_persona(self, raw_text_all_apps, apps_seen, focused_text=""):
         context_lower = raw_text_all_apps.lower()
+        # User-intent triggers match against the focused app's text only (see
+        # check_screen). Falls back to the full blob if we couldn't identify a
+        # focused app, so behaviour degrades to the old whole-screen matching.
+        focused_lower = (focused_text or raw_text_all_apps).lower()
         apps_lower    = {a.lower() for a in apps_seen}
 
         # Clear the "we used an override last tick" flag at the start of
@@ -312,7 +321,8 @@ class TheSeer:
             return self._default_persona(apps_lower)
 
         # 2. Performance-mode enter/exit phrase check (sticky toggle).
-        self._maybe_toggle_performance(context_lower)
+        #    Scoped to the focused app — it's a user-intent phrase.
+        self._maybe_toggle_performance(focused_lower)
 
         # 3. Security keywords always win.
         if any(k.lower() in context_lower
@@ -329,12 +339,14 @@ class TheSeer:
             self.all_clear_count = 0
 
         # 5. One-shot personas (cooldown-protected). First matching trigger wins.
+        #    Matched against the focused app's text only — a coworker's "explain
+        #    this" in a background Slack window shouldn't fire Teacher.
         now = time.monotonic()
         for one_shot in self.ONE_SHOT_PERSONAS:
             kws = p.PERSONAS.get(one_shot, {}).get("trigger_keywords", [])
             if not kws:
                 continue
-            if not any(k.lower() in context_lower for k in kws):
+            if not any(k.lower() in focused_lower for k in kws):
                 continue
             cooldown = self._one_shot_cooldown(one_shot)
             last     = self._one_shot_last_fired.get(one_shot, 0.0)
@@ -415,9 +427,39 @@ class TheSeer:
                 return name
         return "casual"
 
+    # ── Screen capture ─────────────────────────────────────────────
+
+    SCREENSHOT_PATH = "/tmp/theseer_frame.jpg"
+
+    def _capture_screenshot(self):
+        """Grab the main display, downscale, and return a base64 JPEG data URI
+        (the format mlx_vlm's server accepts). Returns None on any failure so
+        the caller degrades gracefully to OCR-only.
+
+        Uses only macOS built-ins (screencapture + sips) — no Python image deps."""
+        try:
+            # -x: silent, -t jpg: JPEG, -D 1: main display only (avoids huge
+            # multi-monitor grabs). Captures without the cursor or shadows.
+            subprocess.run(
+                ["screencapture", "-x", "-t", "jpg", "-D", "1", self.SCREENSHOT_PATH],
+                check=True, timeout=5, capture_output=True,
+            )
+            # Cap the longest side so the payload + vision encoding stay fast.
+            max_px = getattr(cfg, "SCREENSHOT_MAX_PX", 1400)
+            subprocess.run(
+                ["sips", "-Z", str(max_px), self.SCREENSHOT_PATH],
+                check=True, timeout=5, capture_output=True,
+            )
+            with open(self.SCREENSHOT_PATH, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            return f"data:image/jpeg;base64,{b64}"
+        except Exception as e:
+            self.log(f"⚠️  screenshot capture failed — falling back to OCR-only: {e}")
+            return None
+
     # ── LLM calls ──────────────────────────────────────────────────
 
-    def _confidence_call(self, persona_data, context):
+    def _confidence_call(self, persona_data, context, image=None):
         """First LLM call: persona-flavoured tip + confidence score."""
         # Universal output contract — applied to every persona. The text the
         # model produces IS the user-facing notification, so we have to be
@@ -435,6 +477,25 @@ class TheSeer:
             "no references to `the screen`, `the terminal`, `your context`, `this moment`. "
             "One clean standalone sentence — two at most."
         )
+
+        # Build the user turn. When we have a screenshot, send it in the
+        # OpenAI vision format (a content-parts list) so the model can ground
+        # its response in actual layout/focus/visuals, not just OCR text.
+        user_text = f"Screen context: {context}"
+        if image:
+            system_msg += (
+                "\n\nYou are also given a screenshot of the user's screen. Use BOTH the "
+                "screenshot and the OCR text to ground your response in what's actually "
+                "visible — layout, what's focused, diagrams, highlighted errors. Still "
+                "never narrate the screen; just deliver the insight."
+            )
+            user_content = [
+                {"type": "text",      "text": user_text},
+                {"type": "image_url", "image_url": {"url": image}},
+            ]
+        else:
+            user_content = user_text
+
         try:
             response = requests.post(
                 cfg.MLX_SERVER_URL,
@@ -442,11 +503,12 @@ class TheSeer:
                     "model": cfg.MODEL_ID,
                     "messages": [
                         {"role": "system", "content": system_msg},
-                        {"role": "user",   "content": f"Screen context: {context}"},
+                        {"role": "user",   "content": user_content},
                     ],
                     "max_tokens": cfg.MAX_TOKENS,
                 },
-                timeout=15,
+                # Vision encoding is slower than text-only — give it more room.
+                timeout=30 if image else 15,
             )
         except Exception as e:
             self.log(f"⚠️  MLX confidence call failed: {e}")
@@ -604,14 +666,17 @@ class TheSeer:
                 except Exception:
                     continue
                 if when >= cutoff:
-                    fresh.append(item)
+                    fresh.append((when, item))
 
             # Empty `fresh` is OK — we let the flow continue. Casual will
             # invoke the ambient call later; other personas will skip when
             # they discover no context to work with.
+            # Newest-first so app_records[0] is the most recently captured
+            # window — don't rely on screenpipe's response ordering.
+            fresh.sort(key=lambda pair: pair[0], reverse=True)
 
             apps_seen, app_records = set(), []
-            for item in fresh:
+            for _when, item in fresh:
                 app  = item["content"].get("app_name", "Unknown")
                 text = item["content"].get("text", "")
                 if text.strip():
@@ -619,7 +684,14 @@ class TheSeer:
                     apps_seen.add(app)
 
             raw_text     = " ".join(f"[{a}]: {t}" for a, t in app_records)
-            new_persona  = self.determine_persona(raw_text, apps_seen)
+            # app_records[0] is now the most recently captured window — the app
+            # the user is most likely focused on. We scope user-intent keyword
+            # triggers ("be sassy", "explain this", …) to THAT app's text only,
+            # so the same phrase in a background window or someone else's message
+            # doesn't spuriously fire a persona. (Auditor still scans everything.)
+            focused_app  = app_records[0][0] if app_records else None
+            focused_text = " ".join(t for a, t in app_records if a == focused_app)
+            new_persona  = self.determine_persona(raw_text, apps_seen, focused_text)
             if new_persona != self.current_persona:
                 self.log(f"🔄 persona: {self.current_persona} → {new_persona}")
                 self.current_persona = new_persona
@@ -638,13 +710,25 @@ class TheSeer:
                 if self.test_mode:
                     confidence, tip = simple_classifier(self.current_persona, apps_seen, context)
                 else:
-                    confidence, tip = self._confidence_call(persona_data, context)
+                    image = self._capture_screenshot() if cfg.SEND_SCREENSHOTS else None
+                    confidence, tip = self._confidence_call(persona_data, context, image=image)
                     if confidence is None or tip is None:
                         render_card(self.current_persona, ts, status="skipped",
                                     skip_reason="LLM confidence call failed")
                         return
             elif self.current_persona == "casual":
-                # Quiet screen — casual still says something.
+                # Quiet screen. An ambient assistant that talks every idle tick
+                # becomes noise — so we hold our tongue and only pipe up once
+                # per AMBIENT_QUIET_GAP_SEC of genuine quiet.
+                now = time.monotonic()
+                gap = getattr(cfg, "AMBIENT_QUIET_GAP_SEC", 1800)
+                since = now - self._last_ambient_at
+                if since < gap:
+                    mins_left = int((gap - since) // 60)
+                    render_card(self.current_persona, ts, status="skipped",
+                                skip_reason=f"quiet screen — staying silent (~{mins_left}m until next ambient)")
+                    return
+                self._last_ambient_at = now
                 preview = "(quiet — no recent screen activity)"
                 confidence, tip = self._ambient_call()
                 if confidence is None or tip is None:
@@ -660,8 +744,13 @@ class TheSeer:
                 if self.test_mode:
                     confidence, tip = simple_classifier(self.current_persona, apps_seen, "")
                 else:
+                    image = self._capture_screenshot() if cfg.SEND_SCREENSHOTS else None
                     confidence, tip = self._confidence_call(
-                        persona_data, "(no recent screen activity to riff on)"
+                        persona_data,
+                        "(no on-screen text captured — the user explicitly requested you; "
+                        "use the screenshot if it helps, otherwise just deliver your content "
+                        "without referencing the screen)",
+                        image=image,
                     )
                     if confidence is None or tip is None:
                         render_card(self.current_persona, ts, status="skipped",
@@ -674,7 +763,20 @@ class TheSeer:
                             skip_reason=f"no context for {self.current_persona}")
                 return
 
-            all_clear = "all clear" in tip.lower() or not tip.strip()
+            # Catch any variation of "nothing to say about the screen".
+            # The model finds creative wordings despite the negative_prompts,
+            # so we cast a wider net here rather than relying on exact phrases.
+            _AC = (
+                "all clear", "nothing to add", "nothing to comment",
+                "nothing specific", "nothing noteworthy",
+                "screen is empty", "screen appears empty", "screen appears to be",
+                "screen looks empty", "screen is blank", "screen is clear",
+                "nothing on screen", "nothing visible on",
+                "no content", "no text", "no code", "no activity",
+                "i don't see anything", "i cannot see", "i can't see",
+                "doesn't appear to have", "does not appear to have",
+            )
+            all_clear = any(phrase in tip.lower() for phrase in _AC) or not tip.strip()
 
             # ── 2. Priority call ─────────────────────────────────
             priority    = self._priority_call(tip)
